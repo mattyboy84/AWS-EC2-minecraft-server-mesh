@@ -28,4 +28,5 @@ See `.gitlab-ci.yml` for automated deployment.
 This setup leverages **BungeeCord** with a **custom Java plugin** that enables dynamic server discovery, live reloading of proxy target lists, and smooth player session transfers between servers in the mesh.
 
 This is how the plugin displays the list of proxy targets to the players
+
 ![](images/plugin-interface.png)
