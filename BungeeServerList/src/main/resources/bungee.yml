@@ -1,0 +1,5 @@
+name: BungeeServerList
+main: com.matt.bungeeserverlist.BungeeServerListPlugin
+version: 1.0
+author: Matt
+description: Dynamically updates BungeeCord server list from an API.

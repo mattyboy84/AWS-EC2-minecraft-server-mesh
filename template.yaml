@@ -1,0 +1,1199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  vpcCIDR:
+    Type: String
+    Description: cidr block for the vpc (and subnets)
+    Default: 10.48.0.0/16
+  loadBalancerPort:
+    Type: Number
+    Description: the port that the load balancer will listen on
+    Default: "25565"
+  proxyPort:
+    Type: Number
+    Description: the port that the bungee proxy will listen on
+    Default: "25566"
+  serverPort:
+    Type: Number
+    Description: the port that the mc server will listen on
+    Default: "25567"
+  scalingGroupMinSize:
+    Type: String
+    Default: "0"
+  scalingGroupMaxSize:
+    Type: String
+    Default: "10"
+  scalingGroupDesiredSize:
+    Type: String
+    Default: "3"
+  hostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  domainName:
+    Type: String
+    Description: name of domain registered in route 53. - leave blank to omit
+    Default: ''
+  subDomainName:
+    Type: String
+    Description: name of sub domain. - leave blank to omit
+    #Default: ''
+    Default: mc
+  pluginDirectory:
+    Type: String
+    Default: ''
+  stageName:
+    Type: String
+    Default: 'v1'
+  mcVersion:
+    Type: String
+    Description: "the version of mc according to: https://mcversions.net/"
+    Default: "1.20.1"
+    AllowedValues:
+      - "1.20.1"
+      - "1.20"
+      - "1.19.4"
+      - "1.19.3"
+      - "1.19.2"
+      - "1.19.1"
+      - "1.19"
+      - "1.18.2"
+      - "1.18.1"
+      - "1.18"
+      - "1.17.1"
+      - "1.17"
+      - "1.16.5"
+      - "1.16.4"
+      - "1.16.3"
+      - "1.16.2"
+      - "1.16.1"
+      - "1.16"
+      - "1.15.2"
+      - "1.15.1"
+      - "1.15"
+      - "1.14.4"
+      - "1.14.3"
+      - "1.14.2"
+      - "1.14.1"
+      - "1.14"
+      - "1.13.2"
+      - "1.13.1"
+      - "1.13"
+      - "1.12.2"
+      - "1.12.1"
+      - "1.12"
+      - "1.11.2"
+      - "1.11.1"
+      - "1.11"
+      - "1.10.2"
+      - "1.10.1"
+      - "1.10"
+      - "1.9.4"
+      - "1.9.3"
+      - "1.9.2"
+      - "1.9.1"
+      - "1.9"
+      - "1.8.9"
+      - "1.8.8"
+      - "1.8.7"
+      - "1.8.6"
+      - "1.8.5"
+      - "1.8.4"
+      - "1.8.3"
+      - "1.8.2"
+      - "1.8.1"
+      - "1.8"
+      - "1.7.10"
+
+Globals:
+  Function:
+    MemorySize: 3008
+    Timeout: 900
+    CodeUri: ./
+    Runtime: nodejs20.x 
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref serversTable
+        SERVER_PORT: !Ref serverPort
+
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+      - !Not [!Equals [!Ref subDomainName, '']]
+
+Resources:
+  vpcFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-vpc-flow-logging"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+  
+  mcServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-mcServerRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-s3-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "s3:GetObject"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-dynamo-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:Scan"
+                Resource: !GetAtt serversTable.Arn
+        - PolicyName: !Sub "${AWS::StackName}-ec2-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "ec2:DescribeInstances"
+                Resource: '*'
+        - PolicyName: !Sub "${AWS::StackName}-cloudwatch-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: "*"
+  
+  fileBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-file-bucket"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Delete
+  
+  mcServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Sub "${AWS::StackName}-profile"
+      Path: /
+      Roles: 
+        - !Ref mcServerRole
+  
+  ElasticIpA:
+    Type: AWS::EC2::EIP
+    Properties: 
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ElasticIpA"
+  
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpA.AllocationId
+      SubnetId: !Ref publicSubnetA
+  
+  ElasticIpB:
+    Type: AWS::EC2::EIP
+    Properties: 
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ElasticIpB"
+  
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpB.AllocationId
+      SubnetId: !Ref publicSubnetB
+  
+  ElasticIpC:
+    Type: AWS::EC2::EIP
+    Properties: 
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ElasticIpC"
+  
+  NatGatewayC:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpC.AllocationId
+      SubnetId: !Ref publicSubnetC
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-InternetGateway"
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref MCNetworkVPC
+  
+  networkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref MCNetworkVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-networkAcl"
+  
+  ACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: false # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  ACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: true # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  PublicSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  PublicSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  PrivateSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MCNetworkVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    DependsOn:
+      - VPCGatewayAttachment
+  
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MCNetworkVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTableA"
+  
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MCNetworkVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTableB"
+  
+  PrivateRouteTableC:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MCNetworkVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTableC"
+  
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref PrivateRouteTableA
+      NatGatewayId: !Ref NatGatewayA
+  
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref PrivateRouteTableB
+      NatGatewayId: !Ref NatGatewayB
+  
+  PrivateRouteC:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref PrivateRouteTableC
+      NatGatewayId: !Ref NatGatewayC
+  
+  publicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetA
+  
+  publicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetB
+  
+  publicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetC
+  
+  privateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      SubnetId: !Ref privateSubnetA
+  
+  privateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      SubnetId: !Ref privateSubnetB
+  
+  privateSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableC
+      SubnetId: !Ref privateSubnetC
+  
+  MCNetworkVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref vpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+  
+  MCNetworkVPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt vpcFlowLogRole.Arn
+      LogDestination: !GetAtt MCNetworkVPCFlowLogsLogGroup.Arn
+      LogDestinationType: cloud-watch-logs
+      MaxAggregationInterval: 60
+      ResourceId: !Ref MCNetworkVPC
+      ResourceType: VPC
+      TrafficType: ALL
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC-flow-logs"
+  
+  MCNetworkVPCFlowLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/vpc/, !Ref MCNetworkVPC]]
+  
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [0, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetA"
+  
+  publicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [1, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetB"
+  
+  publicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [2, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetC"
+  
+  privateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [3, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetA"
+  
+  privateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [4, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetB"
+  
+  privateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [5, !Cidr [ !GetAtt MCNetworkVPC.CidrBlock, 6, 4 ]]
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref MCNetworkVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetC"
+  
+  serverLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-serverLoadBalancerSecurityGroup"
+      GroupDescription: !Sub "${AWS::StackName}-SecurityGroup description"
+      VpcId: !Ref MCNetworkVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref loadBalancerPort
+          ToPort: !Ref loadBalancerPort
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-serverLoadBalancerSecurityGroup"
+  
+  serverLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-NLB"
+      IpAddressType: ipv4
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+        - !Ref publicSubnetA
+        - !Ref publicSubnetB
+        - !Ref publicSubnetC
+      SecurityGroups:
+        - !Ref serverLoadBalancerSecurityGroup
+  
+  listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: !Ref loadBalancerPort
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref serverLoadBalancer
+  
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${AWS::StackName}-MC-${proxyPort}"
+      TargetType: instance
+      IpAddressType: ipv4
+      Port: !Ref proxyPort
+      Protocol: TCP
+      VpcId: !Ref MCNetworkVPC
+      HealthCheckEnabled: true
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: true
+  
+  instanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${AWS::StackName}-SecurityGroup description"
+      GroupName: !Sub "${AWS::StackName}-SecurityGroup"
+      VpcId: !Ref MCNetworkVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref proxyPort
+          ToPort: !Ref proxyPort
+          SourceSecurityGroupId: !Ref serverLoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: !Ref loadBalancerPort
+          ToPort: !Ref loadBalancerPort
+          CidrIp: !Ref vpcCIDR
+        - IpProtocol: tcp
+          FromPort: !Ref proxyPort
+          ToPort: !Ref proxyPort
+          CidrIp: !Ref vpcCIDR
+        - IpProtocol: tcp
+          FromPort: !Ref serverPort
+          ToPort: !Ref serverPort
+          CidrIp: !Ref vpcCIDR
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instanceSecurityGroup"
+  
+  lobbyScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-lobbyScalingGroup"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref lobbyTemplate
+        Version: !GetAtt lobbyTemplate.LatestVersionNumber
+      MinSize: !Ref scalingGroupMinSize
+      DesiredCapacity: !Ref scalingGroupDesiredSize
+      MaxSize: !Ref scalingGroupMaxSize
+      DesiredCapacityType: "units"
+      VPCZoneIdentifier:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      DefaultInstanceWarmup: 180 #time before metrics are sent to Cloudwatch Metrics
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - GroupMinSize
+            - GroupMaxSize
+            - GroupDesiredCapacity
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: scale-out-hook
+          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+          HeartbeatTimeout: 30
+          DefaultResult: CONTINUE
+        - LifecycleHookName: scale-in-hook
+          LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          HeartbeatTimeout: 30
+          DefaultResult: CONTINUE
+      NewInstancesProtectedFromScaleIn: false #new instances protected when scaling in (terminated)
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-lobby"
+          PropagateAtLaunch: true
+  
+  lobbyTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lobbyTemplate"
+      VersionDescription: "1.0.0"
+      LaunchTemplateData:
+        ImageId: ami-084e8c05825742534
+        InstanceType: t2.medium
+        CreditSpecification:
+          CpuCredits: standard
+        DisableApiTermination: false # true = cannot shutdown via console, api or cli - extra safeguards?
+        EbsOptimized: false # EBS I/O optimized
+        InstanceInitiatedShutdownBehavior: stop # what to do when told to 'shutdown'
+        Monitoring:
+          Enabled: true
+        IamInstanceProfile:
+          Arn: !GetAtt mcServerProfile.Arn
+        MetadataOptions:
+          HttpEndpoint: enabled # curl http://169.254.169.254/latest/meta-data/
+          InstanceMetadataTags: enabled
+        SecurityGroupIds:
+          - !Ref instanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            
+            sudo yum -y update
+            sudo yum install screen
+
+            export BUNGEE_SERVER_API_URL="https://webhook.site/1c670f4e-8eb8-4b9d-97f8-ce5322a07178"
+
+            export _JAVA_OPTIONS='-Xmx2048m'
+            
+            curl https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm -o amazon-cloudwatch-agent.rpm
+            sudo yum install -y ./amazon-cloudwatch-agent.rpm
+            
+            # Create a configuration file for the agent
+            sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
+            {
+              "region": "${AWS::Region}",
+              "namespace": "{instance_id}",
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/messages",
+                        "log_group_name": "${instanceTerminalLogs}",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/opt/minecraft/server/logs/latest.log",
+                        "log_group_name": "${instanceServerLogs}",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/opt/bungeeCord/proxy.log.0",
+                        "log_group_name": "${bungeeCordServerLogs}",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+            # Start and enable the agent
+            sudo systemctl start amazon-cloudwatch-agent
+            sudo systemctl enable amazon-cloudwatch-agent
+            ########################################################################
+            cd /
+            sudo rpm --import https://yum.corretto.aws/corretto.key
+            sudo curl -L -o /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
+            
+            sudo yum install -y java-21-amazon-corretto-devel
+
+            sudo mkdir /opt/bungeeCord
+            cd /opt/bungeeCord
+            sudo curl -L -o /opt/bungeeCord/BungeeCord.jar https://ci.md-5.net/job/BungeeCord/lastStableBuild/artifact/bootstrap/target/BungeeCord.jar
+            
+
+            mkdir /opt/bungeeCord/plugins
+            sudo aws s3 cp ${pluginDirectory} /opt/bungeeCord/plugins/
+            
+            sudo tee config.yml <<EOF
+            groups:
+              md_5:
+              - admin
+            disabled_commands:
+            - disabledcommandhere
+            timeout: 30000
+            online_mode: false
+            reject_transfers: false
+            servers:
+              lobby:
+                motd: '&1Just another BungeeCord - Forced Host'
+                address: localhost:${serverPort}
+                restricted: false
+            server_connect_timeout: 5000
+            listeners:
+            - query_port: ${proxyPort}
+              motd: '&1Another Bungee server'
+              tab_list: GLOBAL_PING
+              query_enabled: false
+              proxy_protocol: false
+              forced_hosts:
+                pvp.md-5.net: pvp
+              ping_passthrough: false
+              priorities:
+              - lobby
+              bind_local_address: true
+              host: 0.0.0.0:${proxyPort}
+              max_players: 1
+              tab_size: 60
+              force_default_server: false
+            stats: 4077b5aa-fe3a-4989-8a7e-28ea3a24f3c8
+            network_compression_threshold: 256
+            log_pings: true
+            permissions:
+              default:
+              - bungeecord.command.server
+              - bungeecord.command.list
+              admin:
+              - bungeecord.command.alert
+              - bungeecord.command.end
+              - bungeecord.command.ip
+              - bungeecord.command.reload
+              - bungeecord.command.kick
+              - bungeecord.command.send
+              - bungeecord.command.find
+            ip_forward: false
+            player_limit: -1
+            log_commands: false
+            connection_throttle_limit: 3
+            connection_throttle: 4000
+            enforce_secure_profile: false
+            prevent_proxy_connections: false
+            remote_ping_timeout: 5000
+            forge_support: false
+            remote_ping_cache: -1
+            max_packets_per_second: 4096
+            max_packets_data_per_second: 33554432
+            EOF
+
+            # Install the server resources
+            cd /
+            sudo adduser minecraft
+
+            sudo su
+            mkdir /opt/minecraft/
+            mkdir /opt/minecraft/server/
+            cd /opt/minecraft/server
+            
+            href=$(curl -s https://mcversions.net/download/${mcVersion} | grep -o '<a class="text-xs whitespace-nowrap py-3 px-8 bg-green-700 hover:bg-green-900 rounded text-white no-underline font-bold transition-colors duration-200"[^>]*href="\([^"]*\)"[^>]*>' | awk -F'"' '{print $4}')
+            sudo wget $href
+
+            sudo tee /opt/minecraft/start_minecraft.sh <<EOF
+            #!/bin/bash
+            
+            cd /opt/minecraft/server
+            screen -S mcserver
+            java -Xmx2048M -jar server.jar nogui
+            EOF
+            
+            sudo tee eula.txt <<EOF
+            eula=true
+            EOF
+
+            sudo tee -a /opt/minecraft/server/server.properties <<EOF
+            server-port=${serverPort}
+            online-mode=false
+            enforce-secure-profile=false
+            difficulty=peaceful
+            EOF
+
+            sudo tee /etc/systemd/system/minecraft.service <<EOF
+            [Unit]
+            Description=Minecraft Server
+            After=network.target
+            
+            [Service]
+            User=root
+            Group=root
+            Type=simple
+            WorkingDirectory=/opt/minecraft/server
+            ExecStart=/opt/minecraft/start_minecraft.sh
+            Restart=on-failure
+            EOF
+            
+            sudo chown -R root:root /opt/minecraft/
+            sudo chown -R root:root /opt/minecraft/start_minecraft.sh
+            sudo chmod +x /opt/minecraft/start_minecraft.sh
+            
+
+            sudo systemctl daemon-reload
+            sudo systemctl start minecraft.service
+            sudo systemctl enable minecraft.service
+            sudo systemctl daemon-reload
+            sudo systemctl start minecraft
+            sudo systemctl enable minecraft
+
+            sudo tee /etc/systemd/system/bungeeCord.service <<EOF
+            [Unit]
+            Description=BungeeCord Proxy
+            After=network.target
+
+            [Service]
+            User=root
+            WorkingDirectory=/opt/bungeeCord
+            Environment="BUNGEE_SERVER_API_URL=https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${stageName}/list"
+            ExecStart=/bin/bash -c "screen -dmS bungee /usr/bin/java -Xms512M -Xmx512M -jar /opt/bungeeCord/BungeeCord.jar; sleep infinity"
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            sudo systemctl start bungeeCord.service
+            sudo systemctl enable bungeeCord.service
+            sudo systemctl start bungeeCord
+            sudo systemctl enable bungeeCord
+  
+  instanceTerminalLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/ec2/, !Sub "${AWS::StackName}-terminal"]]
+  
+  instanceServerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/ec2/, !Sub "${AWS::StackName}-mc-log"]]
+  
+  bungeeCordServerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/ec2/, !Sub "${AWS::StackName}-bungeeCord-log"]]
+  
+  endpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${AWS::StackName}-endpointSecurityGroup description"
+      GroupName: !Sub "${AWS::StackName}-endpointSecurityGroup"
+      VpcId: !Ref MCNetworkVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-endpointSecurityGroup"
+  
+  MCNetworkVPCssmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  MCNetworkVPCssmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - MCNetworkVPCssmEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  MCNetworkVPCec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - MCNetworkVPCssmMessagesEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  MCNetworkVPCec2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - MCNetworkVPCec2MessagesEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  MCNetworkVPClogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  MCNetworkVPCstsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - MCNetworkVPClogsEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+  
+  executeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - MCNetworkVPCstsEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      VpcId: !Ref MCNetworkVPC
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+      SecurityGroupIds:
+        - !Ref endpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource:
+              - '*'
+  
+  loadBalancerRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsDomainConfigured
+    Properties:
+      Name: !Sub "${subDomainName}.${domainName}"
+      HostedZoneId: !Ref hostedZoneId
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt serverLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt serverLoadBalancer.CanonicalHostedZoneID
+  
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref executeEndpoint
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource:
+              - 'execute-api:/*'
+            Condition:
+              StringEquals:
+                aws:SourceVpce:
+                  - !Ref executeEndpoint
+      DisableExecuteApiEndpoint: false
+  
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref stageName
+      DeploymentId: !Ref Deployment
+      TracingEnabled: true
+  
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+    DependsOn:
+      - listMethod
+  
+  listResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: list
+  
+  listMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      OperationName: list route
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${listFunction}/invocations"
+      MethodResponses: []
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt listResource.ResourceId
+  
+  listFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-listFunction"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: src/list.handler
+  
+  listFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref listFunction]]
+  
+  listMethodFunctionEBPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt listFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
+  
+  updateProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-updateProxy"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: src/updateProxy.handler
+  
+  updateProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref updateProxyFunction]]
+  
+  updateProxyFunctionEBPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt updateProxyFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt updateProxyEventRule.Arn
+  
+  updateProxyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-updateProxy-eventRule"
+      State: ENABLED
+      EventPattern:
+        source:
+          - "aws.autoscaling"
+        detail:
+          LifecycleTransition:
+            - "autoscaling:EC2_INSTANCE_LAUNCHING"
+            - "autoscaling:EC2_INSTANCE_TERMINATING"
+          LifecycleHookName:
+            - scale-in-hook
+            - scale-out-hook
+      Targets:
+        - Arn: !GetAtt updateProxyFunction.Arn
+          Id: !Sub "${AWS::StackName}-updateProxy-eventRule"
+  
+  serversTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-serversTable"
+      AttributeDefinitions:
+        - AttributeName: 'id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'id'
+          KeyType: 'HASH'
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification: 
+        Enabled: true
+        AttributeName: ttl

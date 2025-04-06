@@ -1,0 +1,41 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deployBucket
+  - buildPlugin
+  - deploy
+
+variables:
+  BASE: mc-network
+  PLUGIN_STACK_NAME: "$BASE-plugins"
+  PLUGIN_NAME: BungeeServerList
+  STACK_NAME: "$BASE"
+  REGION: eu-west-2
+
+deployBucket:
+  stage: deployBucket
+  script:
+    - sam build --template plugin-template.yaml
+    - sam package --template plugin-template.yaml --output-template-file plugin-packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    - sam deploy --no-fail-on-empty-changeset --template-file plugin-packaged.yaml --stack-name $PLUGIN_STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION
+
+buildPlugin:
+  stage: buildPlugin
+  image: amazonlinux:2
+  before_script:
+    - yum install -y java-11-openjdk-devel maven aws-cli
+    - PLUGIN_BUCKET=$(aws cloudformation describe-stacks --stack-name $PLUGIN_STACK_NAME --region $REGION --query "Stacks[0].Outputs[?OutputKey=='pluginBucket'].OutputValue" --output text)
+  script:
+    - cd $PLUGIN_NAME
+    - mvn clean package
+    - aws s3 cp target/BungeeServerList-1.0-SNAPSHOT.jar s3://$PLUGIN_BUCKET/$PLUGIN_NAME.jar
+
+deploy:
+  stage: deploy
+  before_script:
+    - yum install -y java-11-openjdk-devel maven aws-cli
+    - PLUGIN_BUCKET=$(aws cloudformation describe-stacks --stack-name $PLUGIN_STACK_NAME --region $REGION --query "Stacks[0].Outputs[?OutputKey=='pluginBucket'].OutputValue" --output text)
+  script:
+    - sam build --template template.yaml
+    - sam package --template template.yaml --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides domainName=$ROUTE_53_DOMAIN hostedZoneId=$ROUTE_53_DOMAIN_ID pluginDirectory="s3://$PLUGIN_BUCKET/$PLUGIN_NAME.jar"

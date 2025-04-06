@@ -1,0 +1,7 @@
+.aws-sam
+.vscode
+node_modules
+packaged.yaml
+plugin-packaged.yaml
+tmp
+BungeeServerList/target
